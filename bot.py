@@ -21,7 +21,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import discord
@@ -334,15 +334,12 @@ async def generar_respuesta(
     mensajes: list[dict],
     *,
     con_herramientas: bool = True,
-    en_delta: Optional[Callable[[str], Awaitable[None]]] = None,
     max_tokens: Optional[int] = None,
 ) -> str:
     """Pide una respuesta a DeepSeek en streaming.
 
     - Si el modelo pide usar `buscar_web`, se ejecuta la búsqueda y se repite
       la llamada con los resultados (máximo 2 rondas).
-    - `en_delta` recibe el texto acumulado cada vez que llega un trozo nuevo,
-      para poder mostrar la respuesta en vivo.
     """
     herramientas = (
         [HERRAMIENTA_BUSCAR] if (con_herramientas and BUSQUEDA_WEB and DDGS_DISPONIBLE) else None
@@ -374,8 +371,6 @@ async def generar_respuesta(
                 continue
             if delta.content:
                 texto += delta.content
-                if en_delta is not None:
-                    await en_delta(texto)
             if delta.tool_calls:
                 for llamada in delta.tool_calls:
                     indice = llamada.index or 0
@@ -438,42 +433,25 @@ async def frase_ia(mensaje_usuario: str, max_tokens: int = 100) -> str:
     )
 
 
-def crear_mostrador(placeholder: Optional[discord.Message]):
-    """Devuelve un callback que edita el placeholder en vivo, limitando la
-    frecuencia de edición para no tropezar con los límites de Discord."""
-    ultimo_edit = [0.0]
-
-    async def mostrar(texto: str) -> None:
-        if placeholder is None or not texto.strip():
-            return
-        ahora = time.monotonic()
-        if ahora - ultimo_edit[0] < 0.5:
-            return
-        ultimo_edit[0] = ahora
-        cursor = "" if len(texto) > 1900 else " ▍"
-        try:
-            await placeholder.edit(content=texto + cursor)
-        except discord.HTTPException:
-            pass  # el mensaje pudo ser borrado; no pasa nada
-
-    return mostrar
-
-
 async def publicar_respuesta(
-    placeholder: Optional[discord.Message],
     canal: discord.abc.Messageable,
     texto: str,
+    reply_a: Optional[discord.Message] = None,
 ) -> None:
-    """Publica el texto final: edita el placeholder o lo envía por trozos."""
+    """Envía el texto final de una vez, en trozos si supera el límite de Discord.
+
+    El primer trozo va como respuesta a `reply_a` para que el usuario reciba la
+    notificación; si el reply falla, se envía como mensaje normal.
+    """
     trozos = [texto[i:i + 2000] for i in range(0, len(texto), 2000)]
     for i, trozo in enumerate(trozos):
-        if i == 0 and placeholder is not None:
-            try:
-                await placeholder.edit(content=trozo)
-                continue
-            except discord.HTTPException:
-                placeholder = None  # fue borrado: enviar como mensaje nuevo
         try:
+            if i == 0 and reply_a is not None:
+                try:
+                    await reply_a.reply(trozo, mention_author=False)
+                    continue
+                except discord.HTTPException:
+                    pass  # sin permisos para responder con reply
             await canal.send(trozo)
         except discord.HTTPException as exc:
             log.warning("No se pudo enviar la respuesta: %s", exc)
@@ -714,15 +692,8 @@ async def on_message(message: discord.Message):
     )
 
     try:
-        placeholder = await message.reply("✍️", mention_author=False)
-    except discord.HTTPException:
-        placeholder = None  # sin permisos para responder con reply; lo enviamos normal
-
-    try:
         async with message.channel.typing():
-            respuesta = await generar_respuesta(
-                mensajes, en_delta=crear_mostrador(placeholder)
-            )
+            respuesta = await generar_respuesta(mensajes)
     except Exception as exc:
         log.error("Error inesperado al responder: %s", exc)
         respuesta = FRASE_ERROR_API
@@ -733,7 +704,7 @@ async def on_message(message: discord.Message):
     historial_por_canal[message.channel.id] = recortar_historial(historial)
     await guardar_json(ARCHIVO_HISTORIAL, historial_por_canal)
 
-    await publicar_respuesta(placeholder, message.channel, respuesta)
+    await publicar_respuesta(message.channel, respuesta, reply_a=message)
 
 
 # ------------------------------------------------------------------ comandos
@@ -848,11 +819,8 @@ async def cmd_buscar(ctx, *, consulta: str):
         {"role": "user", "content": f"Consulta: {consulta}\n\nResultados:\n{resultados}"},
     ]
 
-    placeholder = await ctx.send("🔎 Buscando y resumiendo...")
-    respuesta = await generar_respuesta(
-        mensajes, con_herramientas=False, en_delta=crear_mostrador(placeholder)
-    )
-    await publicar_respuesta(placeholder, ctx.channel, respuesta)
+    respuesta = await generar_respuesta(mensajes, con_herramientas=False)
+    await publicar_respuesta(ctx.channel, respuesta, reply_a=ctx.message)
 
 
 @bot.hybrid_command(name="consejo", description="Te doy un consejo ahora mismo")
