@@ -1,0 +1,7 @@
+services:
+  dipsik:
+    build: .
+    container_name: dipsik
+    restart: unless-stopped
+    env_file:
+      - .env

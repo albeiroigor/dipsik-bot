@@ -1,0 +1,14 @@
+[project]
+name = "dipsik"
+version = "0.1.0"
+description = "Bot de Discord que responde con DeepSeek cuando lo mencionan o le responden"
+requires-python = ">=3.12"
+dependencies = [
+    "ddgs>=9.16.0",
+    "discord-py",
+    "openai",
+    "python-dotenv",
+]
+
+[tool.uv]
+package = false
