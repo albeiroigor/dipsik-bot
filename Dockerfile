@@ -12,7 +12,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev
 
-COPY bot.py .
+COPY bot.py personality.py .
 RUN uv sync --frozen --no-dev
 
 RUN useradd -m botuser && chown -R botuser:botuser /app
