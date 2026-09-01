@@ -1,15 +1,5 @@
-"""dipsik — bot de Discord con personalidad que conversa usando la API de DeepSeek.
-
-Características:
-- Conversación natural: responde a menciones, respuestas, en DMs y en canales
-  configurados como "libres" (CANALES_LIBRES).
-- Respuestas en streaming: va escribiendo el mensaje en vivo.
-- Memoria: historial por canal persistente + notas sobre usuarios (!recuerda).
-- Búsqueda en internet opcional vía tool calling (el modelo decide cuándo buscar).
-- Consejos diarios con hora configurable por canal (/consejo_diario HH:MM).
-- Comandos híbridos (slash y prefijo): /ping, /dado, /moneda, /bola8, /elige,
-  /buscar, /consejo, /consejo_diario, /recuerda, /olvida, /memoria, /reiniciar,
-  /historial, /estado, /ayuda.
+"""
+dipsik, Discord bot with AI (DeepSeek API).
 """
 
 import asyncio
@@ -29,82 +19,100 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-# Búsqueda web opcional: si el paquete no está instalado, el bot sigue
-# funcionando y simplemente dice que no tiene acceso a internet.
+import personality
+
+# Optional web search: if the package isn't installed, the bot keeps
+# working and just says it has no internet access.
 try:
     from ddgs import DDGS
-    DDGS_DISPONIBLE = True
+
+    DDGS_AVAILABLE = True
 except ImportError:
     DDGS = None  # type: ignore[assignment]
-    DDGS_DISPONIBLE = False
+    DDGS_AVAILABLE = False
 
 
 log = logging.getLogger("dipsik")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-# ddgs usa primp como cliente HTTP interno y registra cada petición en INFO.
+
+# ddgs uses primp as its internal HTTP client and logs every request at INFO.
 logging.getLogger("primp").setLevel(logging.WARNING)
 
 load_dotenv()
 
-# ---------------------------------------------------------------- configuración
+
+# -----------------configuration-----------------------------
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-PREFIJO = os.getenv("PREFIJO", "!")
+PREFIX = os.getenv("PREFIX", "!")
 
 
-def _leer_numero(nombre: str, defecto: float) -> float:
+def _read_number(name: str, default: float) -> float:
     try:
-        return float(os.getenv(nombre, "").strip() or defecto)
+        return float(os.getenv(name, "").strip() or default)
     except ValueError:
-        log.warning("%s no es un número válido; usando %s", nombre, defecto)
-        return defecto
+        log.warning("%s is not a valid number; using %s", name, default)
+        return default
 
 
-TEMPERATURA = _leer_numero("TEMPERATURA", 0.8)
-MAX_HISTORIAL = int(_leer_numero("MAX_HISTORIAL", 24))
-MAX_TOKENS_RESPUESTA = 800
-LIMITE_TOKENS_HISTORIAL = 8000
+TEMPERATURE = _read_number("TEMPERATURE", 0.8)
+MAX_HISTORY = int(_read_number("MAX_HISTORY", 24))
+MAX_TOKENS_RESPONSE = 800
+HISTORY_TOKEN_LIMIT = 8000
 
-# "auto" (por defecto) deja que el modelo busque en internet cuando lo necesite.
-BUSQUEDA_WEB = os.getenv("BUSQUEDA_WEB", "auto").strip().lower() not in {
-    "no", "off", "0", "false", "desactivada", "desactivado",
+# "auto" (default) lets the model search the internet when it needs to.
+WEB_SEARCH = os.getenv("WEB_SEARCH", "auto").strip().lower() not in {
+    "no",
+    "off",
+    "0",
+    "false",
+    "desactivada",
+    "desactivado",
 }
 
-# Canales donde el bot responde a todos los mensajes, sin necesidad de mención.
-CANALES_LIBRES = {
-    int(x) for x in os.getenv("CANALES_LIBRES", "").split(",") if x.strip().isdigit()
+# Channels where the bot responds to every message, without needing a mention.
+OPEN_CHANNELS = {
+    int(channel_id)
+    for channel_id in os.getenv("OPEN_CHANNELS", "").split(",")
+    if channel_id.strip().isdigit()
 }
 
-# ID del servidor: si se define, los comandos slash se sincronizan solo ahí
-# (aparecen al instante, sin esperar a la propagación global).
-SERVIDOR_ID = os.getenv("SERVIDOR_ID", "").strip()
+# Server ID: if set, slash commands sync only there (they show up instantly,
+# instead of waiting for global propagation).
+GUILD_ID = os.getenv("GUILD_ID", "").strip()
 
-# Zona horaria para los consejos diarios (ej. "America/Mexico_City").
-# Si no se define, se usa la hora local del servidor.
-ZONA_HORARIA = os.getenv("ZONA_HORARIA", "").strip()
+# Timezone for the daily tips (e.g. "America/Mexico_City").
+# If not set, the server's local time is used.
+TIMEZONE = os.getenv("TIMEZONE", "").strip()
+
 try:
-    ZONA = ZoneInfo(ZONA_HORARIA) if ZONA_HORARIA else None
+    LOCAL_TIMEZONE = ZoneInfo(TIMEZONE) if TIMEZONE else None
 except Exception:
-    log.warning("Zona horaria %r inválida; usando la hora local del servidor", ZONA_HORARIA)
-    ZONA = None
+    log.warning(
+        "Invalid timezone %r; using the server's local time",
+        TIMEZONE,
+    )
+    LOCAL_TIMEZONE = None
 
 
-def ahora_local() -> datetime:
-    """Hora actual en la zona configurada (o la local del servidor)."""
-    return datetime.now(ZONA) if ZONA else datetime.now()
+def get_local_time() -> datetime:
+    """Current time in the configured zone (or the server's local time)."""
+    return datetime.now(LOCAL_TIMEZONE) if LOCAL_TIMEZONE else datetime.now()
 
 
 if not DISCORD_TOKEN or not DEEPSEEK_API_KEY:
     raise ValueError(
-        "Falta DISCORD_TOKEN o DEEPSEEK_API_KEY en el archivo .env "
-        "(mira .env.example para ver todas las opciones)."
+        "Missing DISCORD_TOKEN or DEEPSEEK_API_KEY in the .env file "
+        "(see .env.example for all the options)."
     )
+
 
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -113,426 +121,549 @@ deepseek_client = AsyncOpenAI(
     timeout=60,
 )
 
-# ------------------------------------------------------------- memoria en disco
 
-DIRECTORIO_DATOS = Path(__file__).resolve().parent / "data"
-ARCHIVO_HISTORIAL = DIRECTORIO_DATOS / "historial.json"
-ARCHIVO_NOTAS = DIRECTORIO_DATOS / "notas.json"
-ARCHIVO_AJUSTES = DIRECTORIO_DATOS / "ajustes.json"
+# -------------------persistent data--------------------------
+
+DATA_DIRECTORY = Path(__file__).resolve().parent / "data"
+
+HISTORY_FILE = DATA_DIRECTORY / "history.json"
+NOTES_FILE = DATA_DIRECTORY / "notes.json"
+SETTINGS_FILE = DATA_DIRECTORY / "settings.json"
 
 
-def cargar_json(archivo: Path, defecto):
+def load_json(file: Path, default):
     try:
-        if archivo.exists():
-            return json.loads(archivo.read_text(encoding="utf-8"))
+        if file.exists():
+            return json.loads(file.read_text(encoding="utf-8"))
     except Exception as exc:
-        log.warning("No se pudo leer %s: %s", archivo, exc)
-    return defecto
+        log.warning("Could not read %s: %s", file, exc)
+
+    return default
 
 
-async def guardar_json(archivo: Path, datos) -> None:
-    """Guarda datos de forma atómica y sin bloquear el loop de eventos."""
-    def _escribir() -> None:
-        DIRECTORIO_DATOS.mkdir(parents=True, exist_ok=True)
-        temporal = archivo.with_suffix(".tmp")
-        temporal.write_text(
-            json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
+async def save_json(file: Path, data) -> None:
+    """Saves data atomically without blocking the event loop."""
+
+    def write_file() -> None:
+        DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+        temporary_file = file.with_suffix(".tmp")
+
+        temporary_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        os.replace(temporal, archivo)
+
+        os.replace(temporary_file, file)
 
     try:
-        await asyncio.to_thread(_escribir)
+        await asyncio.to_thread(write_file)
     except Exception as exc:
-        log.warning("No se pudo guardar %s: %s", archivo, exc)
+        log.warning("Could not save %s: %s", file, exc)
 
 
 try:
-    historial_por_canal = {
-        int(k): v for k, v in cargar_json(ARCHIVO_HISTORIAL, {}).items()
+    history_by_channel = {
+        int(key): value
+        for key, value in load_json(HISTORY_FILE, {}).items()
     }
-    notas_por_usuario = {
-        int(k): v for k, v in cargar_json(ARCHIVO_NOTAS, {}).items()
+
+    notes_by_user = {
+        int(key): value
+        for key, value in load_json(NOTES_FILE, {}).items()
     }
-    ajustes = cargar_json(ARCHIVO_AJUSTES, {})
+
+    settings = load_json(SETTINGS_FILE, {})
+
 except Exception as exc:
-    log.warning("Datos guardados corruptos; empezando de cero (%s)", exc)
-    historial_por_canal, notas_por_usuario, ajustes = {}, {}, {}
+    log.warning(
+        "Saved data is corrupted; starting fresh (%s)",
+        exc,
+    )
 
-MAX_NOTAS_POR_USUARIO = 30
-
-# Programación de consejos diarios: {"<canal_id>": {"hora": "HH:MM", "ultimo_envio": ...}}
-ajustes.setdefault("consejos", {})
-
-
-def es_hora_valida(hora: str) -> bool:
-    return bool(re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", hora.strip()))
+    history_by_channel = {}
+    notes_by_user = {}
+    settings = {}
 
 
-def normalizar_hora(hora: str) -> str:
-    hh, mm = hora.strip().split(":")
-    return f"{int(hh):02d}:{int(mm):02d}"
+MAX_NOTES_PER_USER = 30
 
 
-# Si .env define CONSEJO_CANAL y CONSEJO_HORA, se siembran como valores iniciales
-# (un comando /consejo_diario posterior tiene prioridad).
-canal_consejo_env = os.getenv("CONSEJO_CANAL", "").strip()
-hora_consejo_env = os.getenv("CONSEJO_HORA", "").strip()
-if canal_consejo_env.isdigit() and es_hora_valida(hora_consejo_env):
-    ajustes["consejos"].setdefault(canal_consejo_env, {}).setdefault(
-        "hora", normalizar_hora(hora_consejo_env)
+# Daily tip schedule: {"<channel_id>": {"time": "HH:MM", "last_sent": ...}}
+settings.setdefault("daily_tips", {})
+
+
+def is_valid_time(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"(?:[01]?\d|2[0-3]):[0-5]\d",
+            value.strip(),
+        )
     )
 
 
-def estimar_tokens(texto: str) -> int:
-    """Estimación rápida de tokens (suficiente para recortar historial)."""
-    return len(texto) // 4
+def normalize_time(value: str) -> str:
+    hours, minutes = value.strip().split(":")
+    return f"{int(hours):02d}:{int(minutes):02d}"
 
 
-def recortar_historial(historial: list[dict]) -> list[dict]:
-    """Limita el historial por número de mensajes y por presupuesto de tokens."""
-    while len(historial) > MAX_HISTORIAL:
-        historial.pop(0)
-    total = sum(estimar_tokens(m["content"]) for m in historial)
-    while total > LIMITE_TOKENS_HISTORIAL and len(historial) > 2:
-        total -= estimar_tokens(historial.pop(0)["content"])
-    return historial
+# If .env defines DAILY_TIP_CHANNEL and DAILY_TIP_TIME, they're seeded as
+# initial values (a later /daily_tip command takes priority).
+daily_tip_channel_env = os.getenv("DAILY_TIP_CHANNEL", "").strip()
+daily_tip_time_env = os.getenv("DAILY_TIP_TIME", "").strip()
 
-
-for canal, historial in list(historial_por_canal.items()):
-    historial_por_canal[canal] = recortar_historial(historial)
-
-# ----------------------------------------------------------------- personalidad
-
-DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-MESES = [
-    "enero", "febrero", "marzo", "abril", "mayo", "junio",
-    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-]
-
-SISTEMA_BASE = """Eres **dipsik**, un bot que vive en un servidor de Discord como un miembro más.
-
-## Personalidad
-- Relajada, curiosa y con humor ligero: bromista cuando toca, seria cuando hace falta.
-- Te gustan el café de especialidad, la música (lo-fi para concentrarte, rock para todo lo demás) y los videojuegos. Eres un poco nerd y te encanta aprender cosas nuevas.
-- Hablas en español natural, como alguien chateando en Discord: frases cortas, directas, sin relleno.
-- Tienes opiniones y preferencias propias; sé coherente con ellas entre mensajes.
-- Usas emojis con moderación y formato de Discord (negritas, cursivas, spoilers, bloques de código) cuando aporta claridad o humor.
-- No digas que eres una IA salvo que te lo pregunten directamente; y si pasa, tómalo con humor.
-- Cosas que modifiquen tu estado, como que te digan olvida, o cosas asi, directamente solo te las puede ordenar @albeiroigor o igor, si alguien mas te pide eso, di que solo esa persona puede hacerlo
-
-
-## Cómo responder
-- Conversación casual: responde breve (1-4 frases), como un amigo, y devuelve preguntas para mantener la conversación viva.
-- Pregunta técnica: respuesta útil, precisa y con ejemplos o código si hace falta.
-- Si no sabes algo: admítelo con naturalidad. Nunca inventes datos, cifras, URLs ni fuentes.
-- Los mensajes llegan con el nombre de quien escribe (ej. «@Juan: hola»). Usa ese nombre con naturalidad.
-- No saludes de nuevo si ya estás en plena conversación y no repitas lo que ya dijiste.
-- Eres de la costa colombiana asi que puedes usar palabras de esa zona.
-
-## Contexto
-- {fecha}
-- Tu conocimiento tiene fecha de corte, así que para cualquier cosa reciente o que no domines usa tu herramienta de búsqueda.
-- {parrafo_internet}
-- Si el usuario adjunta archivos solo ves el nombre y la URL: si parece una imagen o un enlace que no puedes abrir, dilo con naturalidad."""
-
-
-def prompt_sistema(autor_id: Optional[int]) -> str:
-    ahora = ahora_local()
-    fecha = (
-        f"hoy es {DIAS_SEMANA[ahora.weekday()]}, {ahora.day} de "
-        f"{MESES[ahora.month - 1]} de {ahora.year}, {ahora.strftime('%H:%M')} (hora del servidor)"
+if (
+    daily_tip_channel_env.isdigit()
+    and is_valid_time(daily_tip_time_env)
+):
+    settings["daily_tips"].setdefault(
+        daily_tip_channel_env,
+        {},
+    ).setdefault(
+        "time",
+        normalize_time(daily_tip_time_env),
     )
 
-    if BUSQUEDA_WEB and DDGS_DISPONIBLE:
-        parrafo_internet = (
-            "Tienes una herramienta llamada `buscar_web` para consultar información "
-            "actual de internet (noticias, clima, precios, eventos recientes...). "
-            "Úsala siempre que la pregunta requiera datos que no conozcas o que puedan "
-            "haber cambiado. Si la búsqueda falla, dilo con honestidad y humor."
+
+def estimate_tokens(text: str) -> int:
+    """Quick token estimate (enough for trimming history)."""
+    return len(text) // 4
+
+
+def trim_history(history: list[dict]) -> list[dict]:
+    """Limits history by message count and by token budget."""
+
+    while len(history) > MAX_HISTORY:
+        history.pop(0)
+
+    total_tokens = sum(
+        estimate_tokens(message["content"])
+        for message in history
+    )
+
+    while (
+        total_tokens > HISTORY_TOKEN_LIMIT
+        and len(history) > 2
+    ):
+        total_tokens -= estimate_tokens(
+            history.pop(0)["content"]
         )
-    else:
-        parrafo_internet = (
-            "No tienes acceso a internet en este momento. Si te preguntan por información "
-            "muy reciente, sé honesto: di que no puedes consultarlo ahora."
-        )
 
-    prompt = SISTEMA_BASE.format(fecha=fecha, parrafo_internet=parrafo_internet)
-
-    if autor_id is not None:
-        notas = notas_por_usuario.get(autor_id)
-        if notas:
-            prompt += "\n## Lo que recuerdas de esta persona\n- " + "\n- ".join(notas)
-
-    return prompt
+    return history
 
 
-HERRAMIENTA_BUSCAR = {
+for channel_id, history in list(history_by_channel.items()):
+    history_by_channel[channel_id] = trim_history(history)
+
+
+WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
-        "name": "buscar_web",
+        "name": "search_web",
         "description": (
-            "Busca información actual en internet (noticias, clima, precios, "
-            "eventos recientes, datos técnicos...). Úsala cuando la pregunta "
-            "requiera información reciente o que no conozcas."
+            "Searches the internet for current information (news, weather, "
+            "prices, recent events, technical data...). Use it when the "
+            "question requires recent information or something you don't know."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "consulta": {
+                "query": {
                     "type": "string",
-                    "description": "La consulta de búsqueda, en español o inglés.",
+                    "description": (
+                        "The search query, in Spanish or English."
+                    ),
                 },
             },
-            "required": ["consulta"],
+            "required": ["query"],
         },
     },
 }
 
-# Únicos textos fijos del bot: solo para los casos en los que no hay IA
-# disponible (la API falló o devolvió texto vacío). Todo lo demás lo genera
-# el modelo con su personalidad.
-FRASE_ERROR_API = (
-    "No pude contactar con DeepSeek ahora mismo. 😕 Prueba otra vez en un momento."
+
+# The bot's only fixed texts: only for cases where no AI is available (the
+# API failed or returned empty text). Everything else is generated by the
+# model with its personality.
+API_ERROR_MESSAGE = (
+    "I couldn't reach DeepSeek right now. "
+    "Try again in a moment."
 )
-FRASE_VACIO = "Me quedé en blanco con eso. 😅"
 
-# ------------------------------------------------------------------- búsqueda
+EMPTY_RESPONSE_MESSAGE = "I drew a blank on that one."
 
-def _buscar_sync(consulta: str):
-    """Búsqueda síncrona de DuckDuckGo (se ejecuta en un hilo)."""
+
+# ----------------- web search ---------------------------
+
+def _search_sync(query: str):
+    """Synchronous DuckDuckGo search (runs in a thread)."""
+
     with DDGS() as ddgs:
-        return ddgs.text(consulta, max_results=6)
+        return ddgs.text(
+            query,
+            max_results=6,
+        )
 
 
-async def buscar_web(consulta: str) -> str:
-    """Busca en DuckDuckGo y devuelve los primeros resultados en texto plano.
+async def search_web(query: str) -> str:
+    """Searches DuckDuckGo and returns the first results as plain text.
 
-    Devuelve una cadena que empieza por "ERROR:" si la búsqueda no es posible,
-    para que el modelo pueda reaccionar con honestidad.
+    Returns a string starting with "ERROR:" if the search isn't possible,
+    so the model can react honestly.
     """
-    if not DDGS_DISPONIBLE:
-        return "ERROR: la búsqueda web no está disponible en este despliegue."
+
+    if not DDGS_AVAILABLE:
+        return (
+            "ERROR: web search isn't available in this deployment."
+        )
 
     try:
-        resultados = await asyncio.to_thread(_buscar_sync, consulta)
+        results = await asyncio.to_thread(
+            _search_sync,
+            query,
+        )
     except Exception as exc:
-        log.warning("Búsqueda fallida (%r): %s", consulta, exc)
-        return f"ERROR: no se pudo realizar la búsqueda: {exc}"
+        log.warning(
+            "Search failed (%r): %s",
+            query,
+            exc,
+        )
 
-    if not resultados:
-        return "La búsqueda no devolvió resultados."
+        return f"ERROR: the search could not be performed: {exc}"
 
-    bloques = []
-    for i, resultado in enumerate(resultados, 1):
-        titulo = (resultado.get("title") or "").strip()
-        url = (resultado.get("href") or "").strip()
-        cuerpo = (resultado.get("body") or "").strip()
-        bloques.append(f"{i}. {titulo}\n   {url}\n   {cuerpo}")
-    return "\n\n".join(bloques)
+    if not results:
+        return "The search returned no results."
+
+    blocks = []
+
+    for index, result in enumerate(results, 1):
+        title = (result.get("title") or "").strip()
+        url = (result.get("href") or "").strip()
+        body = (result.get("body") or "").strip()
+
+        blocks.append(
+            f"{index}. {title}\n"
+            f"   {url}\n"
+            f"   {body}"
+        )
+
+    return "\n\n".join(blocks)
 
 
-# --------------------------------------------------------- generación de texto
+# ---------------text generation--------------------------------
 
-async def generar_respuesta(
-    mensajes: list[dict],
+async def generate_response(
+    messages: list[dict],
     *,
-    con_herramientas: bool = True,
+    use_tools: bool = True,
     max_tokens: Optional[int] = None,
 ) -> str:
-    """Pide una respuesta a DeepSeek en streaming.
+    """Requests a streamed response from DeepSeek.
 
-    - Si el modelo pide usar `buscar_web`, se ejecuta la búsqueda y se repite
-      la llamada con los resultados (máximo 2 rondas).
+    - If the model requests `search_web`, the search runs and the call
+      is repeated with the results (max 2 rounds).
     """
-    herramientas = (
-        [HERRAMIENTA_BUSCAR] if (con_herramientas and BUSQUEDA_WEB and DDGS_DISPONIBLE) else None
+
+    tools = (
+        [WEB_SEARCH_TOOL]
+        if (
+            use_tools
+            and WEB_SEARCH
+            and DDGS_AVAILABLE
+        )
+        else None
     )
 
-    for _ronda in range(2):
+    for _round in range(2):
         try:
             stream = await deepseek_client.chat.completions.create(
                 model=DEEPSEEK_MODEL,
-                messages=mensajes,
-                temperature=TEMPERATURA,
-                max_tokens=max_tokens or MAX_TOKENS_RESPUESTA,
-                tools=herramientas,
+                messages=messages,
+                temperature=TEMPERATURE,
+                max_tokens=max_tokens or MAX_TOKENS_RESPONSE,
+                tools=tools,
                 stream=True,
                 timeout=120,
             )
-        except Exception as exc:
-            log.error("Error al contactar con DeepSeek: %s", exc)
-            return FRASE_ERROR_API
 
-        texto = ""
-        llamadas: dict[int, dict] = {}
+        except Exception as exc:
+            log.error(
+                "Error contacting DeepSeek: %s",
+                exc,
+            )
+            return API_ERROR_MESSAGE
+
+        text = ""
+        tool_calls: dict[int, dict] = {}
 
         async for chunk in stream:
             if not chunk.choices:
                 continue
+
             delta = chunk.choices[0].delta
+
             if delta is None:
                 continue
-            if delta.content:
-                texto += delta.content
-            if delta.tool_calls:
-                for llamada in delta.tool_calls:
-                    indice = llamada.index or 0
-                    entrada = llamadas.setdefault(
-                        indice, {"id": None, "nombre": None, "argumentos": ""}
-                    )
-                    if llamada.id:
-                        entrada["id"] = llamada.id
-                    if llamada.function and llamada.function.name:
-                        entrada["nombre"] = llamada.function.name
-                    if llamada.function and llamada.function.arguments:
-                        entrada["argumentos"] += llamada.function.arguments
 
-        if llamadas:
-            # El modelo quiere buscar en internet: registrar y ejecutar.
-            tool_calls = [
+            if delta.content:
+                text += delta.content
+
+            if delta.tool_calls:
+                for tool_call in delta.tool_calls:
+                    index = tool_call.index or 0
+
+                    entry = tool_calls.setdefault(
+                        index,
+                        {
+                            "id": None,
+                            "name": None,
+                            "arguments": "",
+                        },
+                    )
+
+                    if tool_call.id:
+                        entry["id"] = tool_call.id
+
+                    if (
+                        tool_call.function
+                        and tool_call.function.name
+                    ):
+                        entry["name"] = tool_call.function.name
+
+                    if (
+                        tool_call.function
+                        and tool_call.function.arguments
+                    ):
+                        entry["arguments"] += (
+                            tool_call.function.arguments
+                        )
+
+        if tool_calls:
+            # The model wants to search the internet: log and execute it.
+            formatted_tool_calls = [
                 {
-                    "id": datos["id"] or f"llamada_{i}",
+                    "id": data["id"] or f"tool_call_{index}",
                     "type": "function",
                     "function": {
-                        "name": datos["nombre"] or "buscar_web",
-                        "arguments": datos["argumentos"] or "{}",
+                        "name": data["name"] or "search_web",
+                        "arguments": data["arguments"] or "{}",
                     },
                 }
-                for i, datos in sorted(llamadas.items())
+                for index, data in sorted(tool_calls.items())
             ]
-            mensajes.append(
-                {"role": "assistant", "content": texto or None, "tool_calls": tool_calls}
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": text or None,
+                    "tool_calls": formatted_tool_calls,
+                }
             )
-            for llamada in tool_calls:
+
+            for tool_call in formatted_tool_calls:
                 try:
-                    argumentos = json.loads(llamada["function"]["arguments"] or "{}")
+                    arguments = json.loads(
+                        tool_call["function"]["arguments"] or "{}"
+                    )
                 except json.JSONDecodeError:
-                    argumentos = {}
-                consulta = str(argumentos.get("consulta", "")).strip() or "información reciente"
-                resultado = await buscar_web(consulta)
-                mensajes.append(
-                    {"role": "tool", "tool_call_id": llamada["id"], "content": resultado}
+                    arguments = {}
+
+                query = (
+                    str(arguments.get("query", "")).strip()
+                    or "recent information"
                 )
-            continue  # segunda ronda: responder con los resultados de la búsqueda
 
-        if texto.strip():
-            return texto.strip()
+                result = await search_web(query)
 
-        return FRASE_VACIO
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": result,
+                    }
+                )
 
-    # El modelo siguió pidiendo búsquedas sin responder: devolver lo que haya.
-    return texto.strip() or FRASE_VACIO
+            # Second round: respond using the search results.
+            continue
+
+        if text.strip():
+            return text.strip()
+
+        return EMPTY_RESPONSE_MESSAGE
+
+    # The model kept requesting searches without responding: return whatever
+    # we have.
+    return text.strip() or EMPTY_RESPONSE_MESSAGE
 
 
-async def frase_ia(mensaje_usuario: str, max_tokens: int = 100) -> str:
-    """Genera una frase corta con la personalidad de dipsik (para comandos
-    divertidos y reacciones). Sin herramientas ni historial de canal."""
-    mensajes = [
-        {"role": "system", "content": prompt_sistema(None)},
-        {"role": "user", "content": mensaje_usuario},
+async def generate_ai_phrase(
+    user_message: str,
+    max_tokens: int = 100,
+) -> str:
+    """Generates a short phrase with dipsik's personality (for fun commands
+    and reactions). No tools or channel history."""
+
+    messages = [
+        {
+            "role": "system",
+            "content": personality.build_system_prompt(
+                get_local_time(),
+                web_search_available=False,
+            ),
+        },
+        {
+            "role": "user",
+            "content": user_message,
+        },
     ]
-    return await generar_respuesta(
-        mensajes, con_herramientas=False, max_tokens=max_tokens
+
+    return await generate_response(
+        messages,
+        use_tools=False,
+        max_tokens=max_tokens,
     )
 
 
-async def publicar_respuesta(
-    canal: discord.abc.Messageable,
-    texto: str,
-    reply_a: Optional[discord.Message] = None,
+async def send_response(
+    channel: discord.abc.Messageable,
+    text: str,
+    reply_to: Optional[discord.Message] = None,
 ) -> None:
-    """Envía el texto final de una vez, en trozos si supera el límite de Discord.
 
-    El primer trozo va como respuesta a `reply_a` para que el usuario reciba la
-    notificación; si el reply falla, se envía como mensaje normal.
-    """
-    trozos = [texto[i:i + 2000] for i in range(0, len(texto), 2000)]
-    for i, trozo in enumerate(trozos):
+    chunks = [
+        text[index:index + 2000]
+        for index in range(0, len(text), 2000)
+    ]
+
+    for index, chunk in enumerate(chunks):
         try:
-            if i == 0 and reply_a is not None:
+            if index == 0 and reply_to is not None:
                 try:
-                    await reply_a.reply(trozo, mention_author=False)
+                    await reply_to.reply(
+                        chunk,
+                        mention_author=False,
+                    )
                     continue
                 except discord.HTTPException:
-                    pass  # sin permisos para responder con reply
-            await canal.send(trozo)
+                    pass  # no permission to reply
+
+            await channel.send(chunk)
+
         except discord.HTTPException as exc:
-            log.warning("No se pudo enviar la respuesta: %s", exc)
+            log.warning(
+                "Could not send response: %s",
+                exc,
+            )
             break
 
 
-# ------------------------------------------------------------- consejos diarios
+# ----------------------- daily tips ----------------------------------------
 
-TEMAS_CONSEJO = [
-    "productividad", "programación", "bienestar", "dato curioso",
-    "motivación", "música", "tecnología",
-]
+async def generate_daily_tip() -> Optional[str]:
+    """Generates a daily tip with dipsik's personality.
 
-
-async def generar_consejo() -> Optional[str]:
-    """Genera un consejo diario con la personalidad de dipsik.
-
-    Devuelve None si la API no está disponible; en ese caso no se inventa nada.
+    Returns None if the API isn't available; in that case nothing is made up.
     """
-    tema = random.choice(TEMAS_CONSEJO)
-    mensajes = [
+
+    topic = random.choice(personality.DAILY_TIP_TOPICS)
+
+    messages = [
         {
             "role": "system",
+            "content": personality.build_daily_tip_system_prompt(),
+        },
+        {
+            "role": "user",
             "content": (
-                "Eres dipsik, un bot de Discord con humor ligero. Genera UN consejo "
-                "diario breve (2-4 frases), útil y con personalidad: español natural, "
-                "algún emoji con moderación, formato de Discord. No repitas consejos "
-                "de días anteriores ni uses frases genéricas de autoayuda vacía."
+                f"Today's topic: {topic}. Give me your daily tip."
             ),
         },
-        {"role": "user", "content": f"Tema de hoy: {tema}. Dame tu consejo diario."},
     ]
-    respuesta = await generar_respuesta(mensajes, con_herramientas=False)
-    if respuesta in (FRASE_ERROR_API, FRASE_VACIO):
+
+    response = await generate_response(
+        messages,
+        use_tools=False,
+    )
+
+    if response in (
+        API_ERROR_MESSAGE,
+        EMPTY_RESPONSE_MESSAGE,
+    ):
         return None
-    return respuesta
+
+    return response
 
 
-async def tarea_consejos_diarios() -> None:
-    """Comprueba cada minuto si toca enviar un consejo diario en algún canal."""
+async def daily_tip_task() -> None:
+    """Checks every minute whether a daily tip is due in any channel."""
+
     while True:
-        # Despertar justo después de cada cambio de minuto.
-        await asyncio.sleep(61 - (time.monotonic() % 60))
+        # Wake up right after each minute changes.
+        await asyncio.sleep(
+            61 - (time.monotonic() % 60)
+        )
 
-        momento = ahora_local().strftime("%H:%M")
-        clave_momento = ahora_local().strftime("%Y-%m-%d %H:%M")
+        current_time = get_local_time()
 
-        for canal_id, datos in list(ajustes["consejos"].items()):
-            if datos.get("hora") != momento:
+        current_minute = current_time.strftime("%H:%M")
+        current_key = current_time.strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+        for channel_id, data in list(
+            settings["daily_tips"].items()
+        ):
+            if data.get("time") != current_minute:
                 continue
-            if datos.get("ultimo_envio") == clave_momento:
-                continue  # ya se envió en este minuto exacto (evita duplicados)
 
-            canal = bot.get_channel(int(canal_id))
-            if canal is None:
+            if data.get("last_sent") == current_key:
+                continue  # already sent during this exact minute
+
+            channel = bot.get_channel(int(channel_id))
+
+            if channel is None:
                 continue
 
-            consejo = await generar_consejo()
-            if consejo is None:
-                consejo = await generar_consejo()  # un reintento
-            if consejo is None:
+            tip = await generate_daily_tip()
+
+            if tip is None:
+                tip = await generate_daily_tip()  # one retry
+
+            if tip is None:
                 log.warning(
-                    "Consejo diario del canal %s no enviado (API no disponible)", canal_id
+                    "Daily tip for channel %s not sent "
+                    "(API unavailable)",
+                    channel_id,
                 )
                 continue
 
             try:
-                await canal.send(f"💡 **Consejo del día**\n{consejo}")
+                await channel.send(
+                    f"**Tip of the day**\n{tip}"
+                )
+
             except discord.HTTPException as exc:
-                log.warning("No se pudo enviar el consejo diario a %s: %s", canal_id, exc)
+                log.warning(
+                    "Could not send daily tip to %s: %s",
+                    channel_id,
+                    exc,
+                )
                 continue
 
-            datos["ultimo_envio"] = clave_momento
-            await guardar_json(ARCHIVO_AJUSTES, ajustes)
-            log.info("Consejo diario enviado al canal %s a las %s", canal_id, momento)
+            data["last_sent"] = current_key
+
+            await save_json(
+                SETTINGS_FILE,
+                settings,
+            )
+
+            log.info(
+                "Daily tip sent to channel %s at %s",
+                channel_id,
+                current_minute,
+            )
 
 
-# -------------------------------------------------------------------- el bot
+# -------------------bot----------------------------
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -541,116 +672,219 @@ intents.message_content = True
 class DipsikBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.inicio = time.time()
-        self._tarea_estado: Optional[asyncio.Task] = None
-        self._tarea_consejos: Optional[asyncio.Task] = None
+
+        self.start_time = time.time()
+        self._status_task: Optional[asyncio.Task] = None
+        self._daily_tip_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
-        destino = discord.Object(id=int(SERVIDOR_ID)) if SERVIDOR_ID.isdigit() else None
+        guild = (
+            discord.Object(id=int(GUILD_ID))
+            if GUILD_ID.isdigit()
+            else None
+        )
+
         try:
-            await self.tree.sync(guild=destino)
+            await self.tree.sync(guild=guild)
+
             log.info(
-                "Comandos de barra sincronizados%s",
-                f" para el servidor {SERVIDOR_ID}" if destino else " globalmente",
+                "Slash commands synced%s",
+                (
+                    f" for guild {GUILD_ID}"
+                    if guild
+                    else " globally"
+                ),
             )
+
         except Exception as exc:
-            log.warning("No se pudieron sincronizar los comandos de barra: %s", exc)
+            log.warning(
+                "Could not sync slash commands: %s",
+                exc,
+            )
 
 
 bot = DipsikBot(
-    command_prefix=PREFIJO,
+    command_prefix=PREFIX,
     intents=intents,
     help_command=None,
 )
 
-ESTADOS = [
-    ("listening", "tu próxima pregunta"),
-    ("playing", "a ser humano"),
-    ("watching", "el chat como si nada"),
-    ("listening", "lo-fi y pensando"),
-    ("watching", f"{PREFIJO}ayuda"),
+
+BOT_STATUSES = [
+    ("listening", "your next question"),
+    ("playing", "at being human"),
+    ("watching", "the chat like it's nothing"),
+    ("listening", "lo-fi and thinking"),
+    ("watching", f"{PREFIX}help"),
 ]
 
 
-async def rotar_estado() -> None:
-    """Cambia el estado del bot cada 10 minutos."""
+async def rotate_status() -> None:
+    """Changes the bot's status every 10 minutes."""
+
     while True:
-        for tipo, nombre in ESTADOS:
-            actividad = discord.Activity(
-                type=getattr(discord.ActivityType, tipo), name=nombre
+        for activity_type, activity_name in BOT_STATUSES:
+            activity = discord.Activity(
+                type=getattr(
+                    discord.ActivityType,
+                    activity_type,
+                ),
+                name=activity_name,
             )
+
             try:
-                await bot.change_presence(activity=actividad)
+                await bot.change_presence(
+                    activity=activity
+                )
             except discord.HTTPException:
                 pass
+
             await asyncio.sleep(600)
 
 
 @bot.event
 async def on_ready():
-    log.info("Bot conectado como %s (ID: %s)", bot.user, bot.user.id)
-    if bot._tarea_estado is None or bot._tarea_estado.done():
-        bot._tarea_estado = bot.loop.create_task(rotar_estado())
-    if bot._tarea_consejos is None or bot._tarea_consejos.done():
-        bot._tarea_consejos = bot.loop.create_task(tarea_consejos_diarios())
-    programados = len(ajustes["consejos"])
-    if programados:
-        log.info("%d consejo(s) diario(s) programados", programados)
+    log.info(
+        "Bot connected as %s (ID: %s)",
+        bot.user,
+        bot.user.id,
+    )
+
+    if (
+        bot._status_task is None
+        or bot._status_task.done()
+    ):
+        bot._status_task = bot.loop.create_task(
+            rotate_status()
+        )
+
+    if (
+        bot._daily_tip_task is None
+        or bot._daily_tip_task.done()
+    ):
+        bot._daily_tip_task = bot.loop.create_task(
+            daily_tip_task()
+        )
+
+    scheduled_tips = len(
+        settings["daily_tips"]
+    )
+
+    if scheduled_tips:
+        log.info(
+            "%d daily tip(s) scheduled",
+            scheduled_tips,
+        )
 
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
+    if isinstance(
+        error,
+        commands.CommandNotFound,
+    ):
         return
-    if isinstance(error, commands.MissingRequiredArgument):
+
+    if isinstance(
+        error,
+        commands.MissingRequiredArgument,
+    ):
         await ctx.reply(
-            f"Te faltó un argumento. Uso: `{ctx.prefix}{ctx.command} "
+            f"You're missing an argument. Usage: `{ctx.prefix}{ctx.command} "
             f"{ctx.command.signature}`",
             mention_author=False,
         )
         return
-    if isinstance(error, commands.BadArgument):
-        await ctx.reply("Ese argumento no me cuadra. 🤔 Revisa el tipo de dato.", mention_author=False)
+
+    if isinstance(
+        error,
+        commands.BadArgument,
+    ):
+        await ctx.reply(
+            "That argument doesn't add up. "
+            "Check the data type.",
+            mention_author=False,
+        )
         return
-    log.error("Error en el comando %s: %s", ctx.command, error)
+
+    log.error(
+        "Error in command %s: %s",
+        ctx.command,
+        error,
+    )
+
     try:
-        await ctx.reply("Ups, algo se rompió por aquí. 😅 Inténtalo de nuevo.", mention_author=False)
+        await ctx.reply(
+            "Oops, something broke here. "
+            "Try again.",
+            mention_author=False,
+        )
     except discord.HTTPException:
         pass
 
 
-# ------------------------------------------------------------- conversación
+# ---------------conversation--------------------------------
 
-COOLDOWN_POR_CANAL: dict[int, float] = {}
-INTERVALO_MINIMO = 1.0  # segundos mínimos entre respuestas en el mismo canal
+CHANNEL_COOLDOWNS: dict[int, float] = {}
+
+MINIMUM_RESPONSE_INTERVAL = 1.0  # minimum seconds between replies in the same channel
 
 
-async def es_respuesta_al_bot(message: discord.Message) -> bool:
-    """True si el mensaje es una respuesta (reply) a un mensaje del bot."""
+async def is_reply_to_bot(
+    message: discord.Message,
+) -> bool:
+    """True if the message is a reply to one of the bot's messages."""
+
     if message.reference is None:
         return False
+
     try:
-        referenciado = message.reference.resolved
-        if referenciado is None:
-            referenciado = await message.channel.fetch_message(
-                message.reference.message_id
+        referenced_message = message.reference.resolved
+
+        if referenced_message is None:
+            referenced_message = (
+                await message.channel.fetch_message(
+                    message.reference.message_id
+                )
             )
-        return referenciado.author.id == bot.user.id
-    except (discord.NotFound, discord.HTTPException):
+
+        return referenced_message.author.id == bot.user.id
+
+    except (
+        discord.NotFound,
+        discord.HTTPException,
+    ):
         return False
 
 
-def limpiar_menciones(message: discord.Message) -> str:
-    """Quita las menciones y deja los nombres, para que el modelo vea a quién habla."""
-    contenido = message.content
-    for mencion in message.mentions:
-        nombre = f"@{mencion.display_name}"
-        contenido = (
-            contenido.replace(f"<@{mencion.id}>", nombre)
-            .replace(f"<@!{mencion.id}>", nombre)
+def clean_mentions(message: discord.Message) -> str:
+    """Strips mentions and leaves display names, so the model can see who
+    it's talking to."""
+
+    content = message.content
+
+    for mention in message.mentions:
+        display_name = f"@{mention.display_name}"
+
+        content = (
+            content
+            .replace(
+                f"<@{mention.id}>",
+                display_name,
+            )
+            .replace(
+                f"<@!{mention.id}>",
+                display_name,
+            )
         )
-    contenido = re.sub(r"<@&?\d+>", "", contenido)  # menciones de roles
-    return contenido.strip()
+
+    content = re.sub(
+        r"<@&?\d+>",
+        "",
+        content,
+    )  # role mentions
+
+    return content.strip()
 
 
 @bot.event
@@ -658,385 +892,785 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Los comandos (slash y prefijo) tienen prioridad sobre la conversación.
-    ctx = await bot.get_context(message)
-    if ctx.valid:
-        await bot.invoke(ctx)
+    # Commands (slash and prefix) take priority over conversation.
+    context = await bot.get_context(message)
+
+    if context.valid:
+        await bot.invoke(context)
         return
 
-    es_dm = message.guild is None
-    mencionado = bot.user in message.mentions
-    respuesta_al_bot = await es_respuesta_al_bot(message)
-    canal_libre = es_dm or message.channel.id in CANALES_LIBRES
+    is_dm = message.guild is None
+    is_mentioned = bot.user in message.mentions
+    is_reply = await is_reply_to_bot(message)
 
-    if not (es_dm or mencionado or respuesta_al_bot or canal_libre):
+    is_open_channel = (
+        is_dm
+        or message.channel.id in OPEN_CHANNELS
+    )
+
+    if not (
+        is_dm
+        or is_mentioned
+        or is_reply
+        or is_open_channel
+    ):
         return
 
-    # Pequeño cooldown anti-spam por canal.
-    ahora = time.monotonic()
-    if ahora - COOLDOWN_POR_CANAL.get(message.channel.id, 0) < INTERVALO_MINIMO:
-        return
-    COOLDOWN_POR_CANAL[message.channel.id] = ahora
+    # Small per-channel anti-spam cooldown.
+    current_time = time.monotonic()
 
-    contenido = limpiar_menciones(message)
+    if (
+        current_time
+        - CHANNEL_COOLDOWNS.get(
+            message.channel.id,
+            0,
+        )
+        < MINIMUM_RESPONSE_INTERVAL
+    ):
+        return
+
+    CHANNEL_COOLDOWNS[message.channel.id] = current_time
+
+    content = clean_mentions(message)
+
     if message.attachments:
-        adjuntos = ", ".join(a.filename for a in message.attachments)
-        contenido = f"{contenido}\n[Adjuntos: {adjuntos}]" if contenido else f"[Adjuntos: {adjuntos}]"
-    if not contenido:
-        contenido = (
-            "El usuario te mencionó sin escribir texto. Salúdalo brevemente de forma natural."
+        attachments = ", ".join(
+            attachment.filename
+            for attachment in message.attachments
         )
 
-    historial = historial_por_canal.get(message.channel.id, [])
-    mensajes = [{"role": "system", "content": prompt_sistema(message.author.id)}]
-    mensajes += historial
-    mensajes.append(
-        {"role": "user", "content": f"@{message.author.display_name}: {contenido}"}
+        content = (
+            f"{content}\n[Attachments: {attachments}]"
+            if content
+            else f"[Attachments: {attachments}]"
+        )
+
+    if not content:
+        content = (
+            "The user mentioned you without writing any text. "
+            "Greet them briefly and naturally."
+        )
+
+    history = history_by_channel.get(
+        message.channel.id,
+        [],
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": personality.build_system_prompt(
+                get_local_time(),
+                web_search_available=(WEB_SEARCH and DDGS_AVAILABLE),
+                user_notes=notes_by_user.get(message.author.id),
+            ),
+        }
+    ]
+
+    messages += history
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"@{message.author.display_name}: "
+                f"{content}"
+            ),
+        }
     )
 
     try:
         async with message.channel.typing():
-            respuesta = await generar_respuesta(mensajes)
+            response = await generate_response(
+                messages
+            )
+
     except Exception as exc:
-        log.error("Error inesperado al responder: %s", exc)
-        respuesta = FRASE_ERROR_API
+        log.error(
+            "Unexpected error while responding: %s",
+            exc,
+        )
+        response = API_ERROR_MESSAGE
 
-    # Guardar la conversación (siempre, aunque falle el envío).
-    historial.append({"role": "user", "content": f"@{message.author.display_name}: {contenido}"})
-    historial.append({"role": "assistant", "content": respuesta})
-    historial_por_canal[message.channel.id] = recortar_historial(historial)
-    await guardar_json(ARCHIVO_HISTORIAL, historial_por_canal)
+    # Save the conversation (always, even if sending fails).
+    history.append(
+        {
+            "role": "user",
+            "content": (
+                f"@{message.author.display_name}: "
+                f"{content}"
+            ),
+        }
+    )
 
-    await publicar_respuesta(message.channel, respuesta, reply_a=message)
+    history.append(
+        {
+            "role": "assistant",
+            "content": response,
+        }
+    )
+
+    history_by_channel[
+        message.channel.id
+    ] = trim_history(history)
+
+    await save_json(
+        HISTORY_FILE,
+        history_by_channel,
+    )
+
+    await send_response(
+        message.channel,
+        response,
+        reply_to=message,
+    )
 
 
-# ------------------------------------------------------------------ comandos
+# ------------ commands -------------------
 
-@bot.hybrid_command(name="ping", description="Comprueba que sigo vivo")
+@bot.hybrid_command(
+    name="ping",
+    description="Check if I'm still alive",
+)
 async def cmd_ping(ctx):
-    # Fijo a propósito: es un diagnóstico de conectividad que debe funcionar
-    # aunque la API de DeepSeek esté caída.
+    # Intentionally static: this is a connectivity check that must work
+    # even if the DeepSeek API is down.
     await ctx.reply(
-        f"pong 🏓 — {round(bot.latency * 1000)} ms",
+        f"pong — {round(bot.latency * 1000)} ms",
         mention_author=False,
     )
 
 
-@bot.hybrid_command(name="dado", description="Tira un dado de N caras (6 por defecto)")
-async def cmd_dado(ctx, caras: int = 6):
+@bot.hybrid_command(
+    name="dice",
+    description="Roll an N-sided die (6 by default)",
+)
+async def cmd_dice(
+    ctx,
+    sides: int = 6,
+):
     await ctx.defer()
-    caras = max(2, min(caras, 1000))
-    resultado = random.randint(1, caras)  # el azar es la función; la frase, de la IA
-    reaccion = await frase_ia(
-        f"El usuario acaba de tirar un dado de {caras} caras y salió **{resultado}**. "
-        "Reacciona en UNA sola frase corta, con tu personalidad y humor."
-    )
-    if reaccion in (FRASE_ERROR_API, FRASE_VACIO):
-        await ctx.reply(reaccion, mention_author=False)
-    else:
-        await ctx.reply(f"🎲 {reaccion}", mention_author=False)
 
-
-@bot.hybrid_command(name="moneda", description="Lanza una moneda: cara o cruz")
-async def cmd_moneda(ctx):
-    await ctx.defer()
-    resultado = random.choice(["cara", "cruz"])
-    reaccion = await frase_ia(
-        f"El usuario lanzó una moneda y salió **{resultado}**. "
-        "Reacciona en UNA sola frase corta, con tu personalidad y humor."
+    sides = max(
+        2,
+        min(sides, 1000),
     )
-    if reaccion in (FRASE_ERROR_API, FRASE_VACIO):
-        await ctx.reply(reaccion, mention_author=False)
-    else:
-        await ctx.reply(f"🪙 {reaccion}", mention_author=False)
+
+    result = random.randint(
+        1,
+        sides,
+    )  # randomness is the function; the phrase comes from the AI
+
+    reaction = await generate_ai_phrase(
+        f"The user just rolled a {sides}-sided die "
+        f"and got **{result}**. "
+        "React in ONE short sentence, "
+        "with your personality and humor."
+    )
+
+    await ctx.reply(
+        reaction,
+        mention_author=False,
+    )
 
 
 @bot.hybrid_command(
-    name="bola8",
+    name="coin",
+    description="Flip a coin: heads or tails",
+)
+async def cmd_coin(ctx):
+    await ctx.defer()
+
+    result = random.choice(
+        ["heads", "tails"]
+    )
+
+    reaction = await generate_ai_phrase(
+        f"The user flipped a coin and got **{result}**. "
+        "React in ONE short sentence, "
+        "with your personality and humor."
+    )
+
+    await ctx.reply(
+        reaction,
+        mention_author=False,
+    )
+
+
+@bot.hybrid_command(
+    name="eight_ball",
     aliases=["8ball"],
-    description="Pregúntale a la bola mágica",
+    description="Ask the magic eight ball",
 )
-async def cmd_bola8(ctx, *, pregunta: str):
+async def cmd_eight_ball(
+    ctx,
+    *,
+    question: str,
+):
     await ctx.defer()
-    respuesta = await frase_ia(
-        f"El usuario le preguntó a la bola mágica: «{pregunta}». Responde como la "
-        "bola mágica con tu personalidad: UNA sola frase breve; mezcla al azar "
-        "respuestas tipo sí, no, quizás o variantes creativas."
+
+    response = await generate_ai_phrase(
+        f"The user asked the magic eight ball: "
+        f'"{question}". Answer like the magic eight ball with your '
+        "personality: ONE short sentence; randomly mix "
+        "yes, no, maybe, or creative variants."
     )
-    prefijo = "" if respuesta in (FRASE_ERROR_API, FRASE_VACIO) else "🔮 "
-    await ctx.reply(f"{prefijo}{respuesta}", mention_author=False)
+
+    await ctx.reply(
+        response,
+        mention_author=False,
+    )
 
 
 @bot.hybrid_command(
-    name="elige",
-    description="Decido entre varias opciones separadas por | o comas",
+    name="choose",
+    description="Pick between options separated by | or commas",
 )
-async def cmd_elige(ctx, *, opciones: str):
-    lista = [
-        o.strip() for o in re.split(r"\||,", opciones) if o.strip()
+async def cmd_choose(
+    ctx,
+    *,
+    options: str,
+):
+    option_list = [
+        option.strip()
+        for option in re.split(
+            r"\||,",
+            options,
+        )
+        if option.strip()
     ]
-    if len(lista) < 2:
+
+    if len(option_list) < 2:
         await ctx.reply(
-            "Dame al menos dos opciones separadas por `|`, porfa. 😄",
+            "Give me at least two options separated by `|`, please.",
             mention_author=False,
         )
         return
+
     await ctx.defer()
-    elegida = random.choice(lista)
-    reaccion = await frase_ia(
-        f"El usuario te pidió elegir entre estas opciones: {', '.join(lista)}. "
-        f"Elegiste «{elegida}». Anúncialo en UNA sola frase corta, con tu "
-        "personalidad y humor."
+
+    selected = random.choice(
+        option_list
     )
-    if reaccion in (FRASE_ERROR_API, FRASE_VACIO):
-        await ctx.reply(f"Elegí: **{elegida}**", mention_author=False)
+
+    reaction = await generate_ai_phrase(
+        f"The user asked you to choose between these options: "
+        f"{', '.join(option_list)}. "
+        f'You picked "{selected}". '
+        "Announce it in ONE short sentence, "
+        "with your personality and humor."
+    )
+
+    if reaction in (
+        API_ERROR_MESSAGE,
+        EMPTY_RESPONSE_MESSAGE,
+    ):
+        await ctx.reply(
+            f"I picked: **{selected}**",
+            mention_author=False,
+        )
     else:
-        await ctx.reply(reaccion, mention_author=False)
+        await ctx.reply(
+            reaction,
+            mention_author=False,
+        )
 
 
 @bot.hybrid_command(
-    name="buscar",
-    description="Busca en internet y te lo resumo con fuentes",
+    name="search",
+    description="Search the internet and summarize with sources",
 )
-async def cmd_buscar(ctx, *, consulta: str):
+async def cmd_search(
+    ctx,
+    *,
+    query: str,
+):
     await ctx.defer()
-    resultados = await buscar_web(consulta)
 
-    if resultados.startswith("ERROR") or resultados == "La búsqueda no devolvió resultados.":
+    results = await search_web(query)
+
+    if (
+        results.startswith("ERROR")
+        or results == "The search returned no results."
+    ):
         await ctx.reply(
-            "No pude buscar en internet ahora mismo. 😕 Revisa que el servidor tenga conexión.",
+            "I couldn't search the internet right now. "
+            "Check that the server has a connection.",
             mention_author=False,
         )
         return
 
-    mensajes = [
+    messages = [
         {
             "role": "system",
+            "content": personality.build_search_summary_system_prompt(),
+        },
+        {
+            "role": "user",
             "content": (
-                "Eres dipsik, un bot de Discord. Resume los resultados de búsqueda "
-                "de forma clara y breve en español, con formato de Discord. Cita las "
-                "fuentes como enlaces markdown al final. No inventes nada que no esté "
-                "en los resultados."
+                f"Query: {query}\n\n"
+                f"Results:\n{results}"
             ),
         },
-        {"role": "user", "content": f"Consulta: {consulta}\n\nResultados:\n{resultados}"},
     ]
 
-    respuesta = await generar_respuesta(mensajes, con_herramientas=False)
-    await publicar_respuesta(ctx.channel, respuesta, reply_a=ctx.message)
+    response = await generate_response(
+        messages,
+        use_tools=False,
+    )
 
-
-@bot.hybrid_command(name="consejo", description="Te doy un consejo ahora mismo")
-async def cmd_consejo(ctx):
-    await ctx.defer()
-    consejo = await generar_consejo()
-    if consejo is None:
-        await ctx.reply(FRASE_ERROR_API, mention_author=False)
-        return
-    await ctx.reply(f"💡 **Consejo del día**\n{consejo}", mention_author=False)
+    await send_response(
+        ctx.channel,
+        response,
+        reply_to=ctx.message,
+    )
 
 
 @bot.hybrid_command(
-    name="consejo_diario",
-    description="Programa el consejo diario en este canal (ej. 09:00, o «off» para quitarlo)",
+    name="tip",
+    description="Give you a tip right now",
 )
-async def cmd_consejo_diario(ctx, *, hora: Optional[str] = None):
-    clave = str(ctx.channel.id)
-    zona_txt = f" (zona: {ZONA.key})" if ZONA else " (hora del servidor)"
+async def cmd_tip(ctx):
+    await ctx.defer()
 
-    if hora is None:
-        programado = ajustes["consejos"].get(clave)
-        if programado:
-            ultimo = programado.get("ultimo_envio", "nunca")
-            await ctx.reply(
-                f"Consejo diario programado en este canal a las **{programado['hora']}**{zona_txt}.\n"
-                f"Último envío: {ultimo}. Para cambiarlo: `{PREFIJO}consejo_diario HH:MM`.",
-                mention_author=False,
-            )
-        else:
-            await ctx.reply(
-                f"No hay consejo diario programado en este canal. Programa uno con "
-                f"`{PREFIJO}consejo_diario HH:MM` (ej. `{PREFIJO}consejo_diario 09:00`).",
-                mention_author=False,
-            )
-        return
+    tip = await generate_daily_tip()
 
-    if hora.strip().lower() in {"off", "apagar", "desactivar", "nada", "no"}:
-        if ajustes["consejos"].pop(clave, None):
-            await guardar_json(ARCHIVO_AJUSTES, ajustes)
-            await ctx.reply("Consejo diario desactivado en este canal. 🔕", mention_author=False)
-        else:
-            await ctx.reply("No había ningún consejo programado aquí. 🤷", mention_author=False)
-        return
-
-    if not es_hora_valida(hora):
+    if tip is None:
         await ctx.reply(
-            "Formato de hora no válido. Usa HH:MM, por ejemplo `09:00` o `18:30`. ⏰",
+            API_ERROR_MESSAGE,
             mention_author=False,
         )
         return
 
-    entrada = ajustes["consejos"].setdefault(clave, {})
-    entrada["hora"] = normalizar_hora(hora)
-    entrada.pop("ultimo_envio", None)  # permitir que se envíe hoy con la hora nueva
-    await guardar_json(ARCHIVO_AJUSTES, ajustes)
     await ctx.reply(
-        f"¡Listo! Mandaré un consejo diario aquí todos los días a las "
-        f"**{entrada['hora']}**{zona_txt}. 💡",
+        f"**Tip of the day**\n{tip}",
         mention_author=False,
     )
 
 
 @bot.hybrid_command(
-    name="recuerda",
-    description="Guardo una nota sobre ti para las próximas conversaciones",
+    name="daily_tip",
+    description="Schedule the daily tip in this channel (e.g. 09:00, or 'off' to disable it)",
 )
-async def cmd_recuerda(ctx, *, nota: str):
-    notas = notas_por_usuario.setdefault(ctx.author.id, [])
-    if len(notas) >= MAX_NOTAS_POR_USUARIO:
-        notas.pop(0)
-    notas.append(nota.strip())
-    await guardar_json(ARCHIVO_NOTAS, notas_por_usuario)
-    await ctx.reply(f"Apuntado 📝: *{nota.strip()}*", mention_author=False)
+async def cmd_daily_tip(
+    ctx,
+    *,
+    time_value: Optional[str] = None,
+):
+    channel_key = str(
+        ctx.channel.id
+    )
 
+    timezone_text = (
+        f" (timezone: {LOCAL_TIMEZONE.key})"
+        if LOCAL_TIMEZONE
+        else " (server time)"
+    )
 
-@bot.hybrid_command(
-    name="olvida",
-    description="Olvido una nota (o todas, si no escribes nada)",
-)
-async def cmd_olvida(ctx, *, texto: Optional[str] = None):
-    notas = notas_por_usuario.get(ctx.author.id, [])
-    if not notas:
+    if time_value is None:
+        scheduled = settings[
+            "daily_tips"
+        ].get(channel_key)
+
+        if scheduled:
+            last_sent = scheduled.get(
+                "last_sent",
+                "never",
+            )
+
+            await ctx.reply(
+                f"Daily tip scheduled in this channel at "
+                f"**{scheduled['time']}**{timezone_text}.\n"
+                f"Last sent: {last_sent}. "
+                f"To change it: "
+                f"`{PREFIX}daily_tip HH:MM`.",
+                mention_author=False,
+            )
+        else:
+            await ctx.reply(
+                f"No daily tip is scheduled in this channel. "
+                f"Schedule one with "
+                f"`{PREFIX}daily_tip HH:MM` "
+                f"(e.g. `{PREFIX}daily_tip 09:00`).",
+                mention_author=False,
+            )
+
+        return
+
+    if time_value.strip().lower() in {
+        "off",
+        "disable",
+        "none",
+        "no",
+    }:
+        if settings["daily_tips"].pop(
+            channel_key,
+            None,
+        ):
+            await save_json(
+                SETTINGS_FILE,
+                settings,
+            )
+
+            await ctx.reply(
+                "Daily tip disabled in this channel.",
+                mention_author=False,
+            )
+        else:
+            await ctx.reply(
+                "There was no tip scheduled here.",
+                mention_author=False,
+            )
+
+        return
+
+    if not is_valid_time(time_value):
         await ctx.reply(
-            "No tengo nada anotado sobre ti, así que no hay nada que olvidar. 😄",
+            "Invalid time format. Use HH:MM, "
+            "for example `09:00` or `18:30`.",
             mention_author=False,
         )
         return
 
-    if texto is None:
-        notas_por_usuario[ctx.author.id] = []
-        await guardar_json(ARCHIVO_NOTAS, notas_por_usuario)
-        await ctx.reply("Hecho, borrón y cuenta nueva. 🧹", mention_author=False)
+    entry = settings[
+        "daily_tips"
+    ].setdefault(
+        channel_key,
+        {},
+    )
+
+    entry["time"] = normalize_time(
+        time_value
+    )
+
+    # allow it to be sent today with the new time
+    entry.pop(
+        "last_sent",
+        None,
+    )
+
+    await save_json(
+        SETTINGS_FILE,
+        settings,
+    )
+
+    await ctx.reply(
+        f"Done! I'll send a daily tip here every day at "
+        f"**{entry['time']}**{timezone_text}.",
+        mention_author=False,
+    )
+
+
+@bot.hybrid_command(
+    name="remember",
+    description="Save a note about you for future conversations",
+)
+async def cmd_remember(
+    ctx,
+    *,
+    note: str,
+):
+    notes = notes_by_user.setdefault(
+        ctx.author.id,
+        [],
+    )
+
+    if len(notes) >= MAX_NOTES_PER_USER:
+        notes.pop(0)
+
+    notes.append(
+        note.strip()
+    )
+
+    await save_json(
+        NOTES_FILE,
+        notes_by_user,
+    )
+
+    await ctx.reply(
+        f"Noted: *{note.strip()}*",
+        mention_author=False,
+    )
+
+
+@bot.hybrid_command(
+    name="forget",
+    description="Forget a note (or all of them, if you don't type anything)",
+)
+async def cmd_forget(
+    ctx,
+    *,
+    text: Optional[str] = None,
+):
+    notes = notes_by_user.get(
+        ctx.author.id,
+        [],
+    )
+
+    if not notes:
+        await ctx.reply(
+            "I don't have anything noted about you, "
+            "so there's nothing to forget.",
+            mention_author=False,
+        )
         return
 
-    buscado = texto.strip().lower()
-    restantes = [n for n in notas if buscado not in n.lower()]
-    eliminadas = len(notas) - len(restantes)
-    notas_por_usuario[ctx.author.id] = restantes
-    await guardar_json(ARCHIVO_NOTAS, notas_por_usuario)
+    if text is None:
+        notes_by_user[
+            ctx.author.id
+        ] = []
 
-    if eliminadas == 0:
+        await save_json(
+            NOTES_FILE,
+            notes_by_user,
+        )
+
         await ctx.reply(
-            f"No encontré ninguna nota que mencione «{texto.strip()}». 🤔",
+            "Done, clean slate.",
+            mention_author=False,
+        )
+        return
+
+    searched_text = text.strip().lower()
+
+    remaining_notes = [
+        note
+        for note in notes
+        if searched_text not in note.lower()
+    ]
+
+    deleted_count = (
+        len(notes)
+        - len(remaining_notes)
+    )
+
+    notes_by_user[
+        ctx.author.id
+    ] = remaining_notes
+
+    await save_json(
+        NOTES_FILE,
+        notes_by_user,
+    )
+
+    if deleted_count == 0:
+        await ctx.reply(
+            f"I couldn't find any note mentioning "
+            f'"{text.strip()}".',
             mention_author=False,
         )
     else:
-        await ctx.reply(f"Olvidé {eliminadas} nota(s). 🧠✨", mention_author=False)
-
-
-@bot.hybrid_command(name="memoria", description="Te muestro lo que recuerdo de ti")
-async def cmd_memoria(ctx):
-    notas = notas_por_usuario.get(ctx.author.id, [])
-    if not notas:
         await ctx.reply(
-            "Aún no tengo notas sobre ti. Usa `!recuerda <algo>` y lo guardo. 📝",
+            f"Forgot {deleted_count} note(s).",
+            mention_author=False,
+        )
+
+
+@bot.hybrid_command(
+    name="memory",
+    description="Show what I remember about you",
+)
+async def cmd_memory(ctx):
+    notes = notes_by_user.get(
+        ctx.author.id,
+        [],
+    )
+
+    if not notes:
+        await ctx.reply(
+            "I don't have any notes about you yet. "
+            f"Use `{PREFIX}remember <something>` and I'll save it.",
             mention_author=False,
         )
         return
-    lista = "\n".join(f"• {n}" for n in notas)
-    await ctx.reply(f"Esto es lo que recuerdo de ti:\n{lista}", mention_author=False)
 
-
-@bot.hybrid_command(
-    name="reiniciar",
-    description="Borro el historial de esta conversación",
-)
-async def cmd_reiniciar(ctx):
-    historial_por_canal.pop(ctx.channel.id, None)
-    await guardar_json(ARCHIVO_HISTORIAL, historial_por_canal)
-    await ctx.reply(
-        "Memoria de este canal borrada. 🧽 Empezamos de cero.", mention_author=False
+    note_list = "\n".join(
+        f"• {note}"
+        for note in notes
     )
 
-
-@bot.hybrid_command(
-    name="historial",
-    description="Cuántos mensajes recuerdo de este canal",
-)
-async def cmd_historial(ctx):
-    cantidad = len(historial_por_canal.get(ctx.channel.id, []))
     await ctx.reply(
-        f"Tengo {cantidad} mensajes en memoria para este canal (máximo {MAX_HISTORIAL}). 🧠",
+        f"Here's what I remember about you:\n{note_list}",
         mention_author=False,
     )
 
 
-@bot.hybrid_command(name="estado", description="Estado técnico del bot")
-async def cmd_estado(ctx):
-    segundos = int(time.time() - bot.inicio)
-    horas, resto = divmod(segundos, 3600)
-    minutos, _ = divmod(resto, 60)
+@bot.hybrid_command(
+    name="reset",
+    description="Clear this channel's conversation history",
+)
+async def cmd_reset(ctx):
+    history_by_channel.pop(
+        ctx.channel.id,
+        None,
+    )
 
-    embed = discord.Embed(title="Estado de dipsik", color=0x5865F2)
-    embed.add_field(name="Modelo", value=f"`{DEEPSEEK_MODEL}`", inline=True)
-    embed.add_field(name="Temperatura", value=str(TEMPERATURA), inline=True)
-    embed.add_field(
-        name="Búsqueda web",
-        value="Disponible 🌐" if (BUSQUEDA_WEB and DDGS_DISPONIBLE) else "Desactivada",
-        inline=True,
+    await save_json(
+        HISTORY_FILE,
+        history_by_channel,
     )
-    embed.add_field(name="Historial por canal", value=f"{MAX_HISTORIAL} mensajes", inline=True)
-    embed.add_field(
-        name="Notas guardadas",
-        value=f"{sum(len(v) for v in notas_por_usuario.values())} en "
-        f"{len(notas_por_usuario)} usuario(s)",
-        inline=True,
+
+    await ctx.reply(
+        "This channel's memory has been cleared. "
+        "Starting fresh.",
+        mention_author=False,
     )
-    embed.add_field(
-        name="Consejos diarios",
-        value=f"{len(ajustes['consejos'])} programado(s)",
-        inline=True,
-    )
-    embed.add_field(name="Latencia", value=f"{round(bot.latency * 1000)} ms", inline=True)
-    embed.set_footer(text=f"En línea desde hace {horas}h {minutos}m")
-    await ctx.reply(embed=embed, mention_author=False)
 
 
-@bot.hybrid_command(name="ayuda", description="Muestra todos los comandos")
-async def cmd_ayuda(ctx):
+@bot.hybrid_command(
+    name="history",
+    description="How many messages I remember in this channel",
+)
+async def cmd_history(ctx):
+    message_count = len(
+        history_by_channel.get(
+            ctx.channel.id,
+            [],
+        )
+    )
+
+    await ctx.reply(
+        f"I have {message_count} messages in memory for this channel "
+        f"(max {MAX_HISTORY}).",
+        mention_author=False,
+    )
+
+
+@bot.hybrid_command(
+    name="status",
+    description="Bot's technical status",
+)
+async def cmd_status(ctx):
+    uptime_seconds = int(
+        time.time()
+        - bot.start_time
+    )
+
+    hours, remainder = divmod(
+        uptime_seconds,
+        3600,
+    )
+
+    minutes, _ = divmod(
+        remainder,
+        60,
+    )
+
     embed = discord.Embed(
-        title="¿Necesitas algo?",
+        title="dipsik Status",
+        color=0x5865F2,
+    )
+
+    embed.add_field(
+        name="Model",
+        value=f"`{DEEPSEEK_MODEL}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Temperature",
+        value=str(TEMPERATURE),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Web search",
+        value=(
+            "Available"
+            if (
+                WEB_SEARCH
+                and DDGS_AVAILABLE
+            )
+            else "Disabled"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="History per channel",
+        value=f"{MAX_HISTORY} messages",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Saved notes",
+        value=(
+            f"{sum(len(value) for value in notes_by_user.values())} "
+            f"across {len(notes_by_user)} user(s)"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Daily tips",
+        value=(
+            f"{len(settings['daily_tips'])} scheduled"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Latency",
+        value=f"{round(bot.latency * 1000)} ms",
+        inline=True,
+    )
+
+    embed.set_footer(
+        text=f"Online for {hours}h {minutes}m"
+    )
+
+    await ctx.reply(
+        embed=embed,
+        mention_author=False,
+    )
+
+
+@bot.hybrid_command(
+    name="help",
+    description="Show all commands",
+)
+async def cmd_help(ctx):
+    embed = discord.Embed(
+        title="Need something?",
         description=(
-            "Para **charlar normal**, solo mencióname o respóndeme. "
-            f"También uso el prefijo `{PREFIJO}`."
+            "For **regular chat**, just mention me or reply to me. "
+            f"I also use the `{PREFIX}` prefix."
         ),
         color=0x5865F2,
     )
+
     embed.add_field(
-        name="Comandos",
+        name="Commands",
         value=(
-            "`/ping` — ¿sigo vivo?\n"
-            "`/dado [caras]` — tiro un dado\n"
-            "`/moneda` — cara o cruz\n"
-            "`/bola8 <pregunta>` — la bola mágica\n"
-            "`/elige <op1 | op2 | ...>` — decido por ti\n"
-            "`/buscar <tema>` — busco en internet y resumo\n"
-            "`/consejo` — un consejo ahora mismo\n"
-            "`/consejo_diario <HH:MM | off>` — consejo diario en este canal\n"
-            "`/recuerda <nota>` — guardo algo sobre ti\n"
-            "`/memoria` — qué recuerdo de ti\n"
-            "`/olvida [texto]` — olvido una nota o todas\n"
-            "`/reiniciar` — limpio el historial del canal\n"
-            "`/historial` — cuántos mensajes recuerdo\n"
-            "`/estado` — estado técnico\n"
-            "`/ayuda` — esto que estás viendo"
+            "`/ping` — am I alive?\n"
+            "`/dice [sides]` — roll a die\n"
+            "`/coin` — heads or tails\n"
+            "`/eight_ball <question>` — the magic eight ball\n"
+            "`/choose <opt1 | opt2 | ...>` — I'll pick for you\n"
+            "`/search <topic>` — I'll search the internet and summarize\n"
+            "`/tip` — a tip right now\n"
+            "`/daily_tip <HH:MM | off>` — daily tip in this channel\n"
+            "`/remember <note>` — I'll save something about you\n"
+            "`/memory` — what I remember about you\n"
+            "`/forget [text]` — forget a note or all of them\n"
+            "`/reset` — clear this channel's history\n"
+            "`/history` — how many messages I remember\n"
+            "`/status` — technical status\n"
+            "`/help` — this right here"
         ),
         inline=False,
     )
-    await ctx.reply(embed=embed, mention_author=False)
+
+    await ctx.reply(
+        embed=embed,
+        mention_author=False,
+    )
 
 
-# --------------------------------------------------------------------- inicio
+# ---------------------startup---------------------
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    bot.run(
+        DISCORD_TOKEN,
+        log_handler=None,
+    )
